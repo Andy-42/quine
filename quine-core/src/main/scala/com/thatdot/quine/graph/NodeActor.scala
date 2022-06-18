@@ -3,6 +3,7 @@ package com.thatdot.quine.graph
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.locks.StampedLock
 
+import scala.annotation.tailrec
 import scala.collection.compat._
 import scala.collection.mutable.{Map => MutableMap}
 import scala.concurrent.Future
@@ -151,34 +152,15 @@ private[graph] class NodeActor(
     else if (atTimeOverride.isDefined && events.size > 1)
       Future.failed(IllegalTimeOverride(events, qid, atTimeOverride.get))
     else {
-      val dedupedEffectingEvents: Seq[NodeChangeEvent.WithTime] = {
-        if (events.isEmpty) Seq.empty
+      def atTime() = atTimeOverride.getOrElse(nextEventTime())
+
+      val dedupedEffectingEvents: Seq[NodeChangeEvent.WithTime] =
+        if (events.isEmpty)
+          Seq.empty
         else if (events.size == 1 && hasEffect(events.head))
-          Seq(NodeChangeEvent.WithTime(events.head, atTimeOverride.getOrElse(nextEventTime())))
-        else {
-          /* This process reverses the events, considering only the last event per property/edge/etc. and keeps the
-           * event if it has an effect. If multiple events would affect the same value (e.g. have the same property key),
-           * but would result in no change when applied in order, then no change at all will be applied. e.g. if a
-           * property exists, and these events would remove it and set it back to its same value, then no change to the
-           * property will be recorded at all. Original event order is maintained. */
-          var es: Set[HalfEdge] = Set.empty
-          var ps: Set[Symbol] = Set.empty
-          var ft: Option[QuineId] = None
-          var mih: Set[QuineId] = Set.empty
-          events.reverse
-            .filter {
-              case e @ EdgeAdded(ha) => if (es.contains(ha)) false else { es += ha; hasEffect(e) }
-              case e @ EdgeRemoved(ha) => if (es.contains(ha)) false else { es += ha; hasEffect(e) }
-              case e @ PropertySet(k, _) => if (ps.contains(k)) false else { ps += k; hasEffect(e) }
-              case e @ PropertyRemoved(k, _) => if (ps.contains(k)) false else { ps += k; hasEffect(e) }
-              case e @ MergedIntoOther(id) => if (ft.isDefined) false else { ft = Some(id); hasEffect(e) }
-              case e @ MergedHere(o) => if (mih.contains(o)) false else { mih += o; hasEffect(e) }
-            }
-            .reverse
-            .map(e => WithTime(e, atTimeOverride.getOrElse(nextEventTime())))
-          // TODO: It should be possible to do all this in only two passes over the collection with no reverses.
-        }
-      }
+          Seq(NodeChangeEvent.WithTime(events.head, atTime()))
+        else
+          NodeActor.dedupEvents(events, atTime, hasEffect)
 
       val persistAttempts = new AtomicInteger(1)
       def persistEventsToJournal(): Future[Done.type] =
@@ -562,5 +544,54 @@ private[graph] class NodeActor(
           journal
         )
       }
+  }
+}
+
+object NodeActor {
+  /*
+   * This is the original implementation of dedupEvents
+   *
+   * This process reverses the events, considering only the last event per property/edge/etc. and keeps the
+   * event if it has an effect. If multiple events would affect the same value (e.g. have the same property key),
+   * but would result in no change when applied in order, then no change at all will be applied. e.g. if a
+   * property exists, and these events would remove it and set it back to its same value, then no change to the
+ property will be recorded at all. Original event order is maintained.
+   */
+  def dedupEvents(
+    events: Seq[NodeChangeEvent],
+    eventTime: () => EventTime,
+    hasEffect: NodeChangeEvent => Boolean, // for testing
+    copyThreshold: Int = 16 // for tuning
+  ): Seq[WithTime] = {
+
+    var es: Set[HalfEdge] = Set.empty
+    var ps: Set[Symbol] = Set.empty
+    var ft: Option[QuineId] = None
+    var mih: Set[QuineId] = Set.empty
+
+    def anOverridingEventOccursLater(event: NodeChangeEvent): Boolean = event match {
+      case EdgeAdded(ha) => if (es.contains(ha)) true else { es += ha; false }
+      case EdgeRemoved(ha) => if (es.contains(ha)) true else { es += ha; false }
+      case PropertySet(k, _) => if (ps.contains(k)) true else { ps += k; false }
+      case PropertyRemoved(k, _) => if (ps.contains(k)) true else { ps += k; false }
+      case MergedIntoOther(id) => if (ft.isDefined) false else { ft = Some(id); false }
+      case MergedHere(o) => if (mih.contains(o)) false else { mih += o; false }
+    }
+
+    val indexableEvents = events.toIndexedSeq
+
+    @tailrec
+    def accumulate(r: List[WithTime] = Nil, i: Int = indexableEvents.length - 1): Seq[WithTime] =
+      if (i < 0)
+        r
+      else {
+        val e = indexableEvents(i)
+        if (!anOverridingEventOccursLater(e) && hasEffect(e))
+          accumulate(r = WithTime(e, eventTime()) :: r, i = i - 1)
+        else
+          accumulate(r = r, i = i - 1)
+      }
+
+    accumulate()
   }
 }
